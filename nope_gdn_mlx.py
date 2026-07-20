@@ -57,7 +57,7 @@ READ THIS BEFORE USING
 5. NO AUTOCAST.
    There is no `torch.amp` equivalent. Cast inputs and weights manually.
    Recommended: keep state matrices in float32 (overflow risk in fp16),
-   everything else in bfloat16 (M3+ supports bf16; CUDA backend always does).
+   everything else in bfloat16 (M4+ supports bf16; CUDA backend always does).
 
 ═════════════════════════════════════════════════════════════════════════════
 """
@@ -1081,7 +1081,7 @@ class GatedDeltaLayer(nn.Module):
     # y columns (D×C) live in threadgroup memory.
     #
     # WHY NOT PER-THREAD REGISTER y_col[C]?
-    # On M3 GPUs, a `float y_col[C]` declared at function scope is placed in
+    # On M4 GPUs, a `float y_col[C]` declared at function scope is placed in
     # the per-thread stack. For C ≤ 32 it fits in registers; for C ≥ 40 the
     # array spills into thread-local memory and produces silently corrupted
     # values (verified empirically: rel error 1e-7 at C=32, ~1.0 at C ≥ 40).
@@ -1204,7 +1204,7 @@ class GatedDeltaLayer(nn.Module):
     # C-1 down to 0). Same threadgroup layout: D threads per threadgroup,
     # each thread owns one output column. y_cols sits in threadgroup memory
     # for the same reason it does in the lower-tri kernel (per-thread arrays
-    # of size C ≥ 40 spill on M3 and corrupt output).
+    # of size C ≥ 40 spill on M4 and corrupt output).
 
     _tri_solve_upper_metal_source = r"""
         // Compile-time:
@@ -1493,7 +1493,7 @@ class GatedDeltaLayer(nn.Module):
     #
     # Per-thread registers: state_row[D] (the tid-th row of the previous-chunk
     # state, held throughout the kernel) + scalar scratch ≈ 256–300 bytes,
-    # well within the M3 register budget.
+    # well within the M4 register budget.
     #
     # Algorithm (per thread tid):
     #   1. Cooperative load IA into L_tg.
@@ -2067,7 +2067,7 @@ class GatedDeltaLayer(nn.Module):
     # ALL (s,t) pairs in which it appears; see comments below).
     #
     # We split into TWO kernel launches so per-thread memory stays within the
-    # M3 register budget (~512 bytes per thread):
+    # M4 register budget (~512 bytes per thread):
     #
     #   Kernel A: dK + dQ          (per-thread: 2 D-vector accumulators = 512 B)
     #   Kernel B: dγ                (per-thread: 1 D-vector + Q_s[D] = 512 B)
