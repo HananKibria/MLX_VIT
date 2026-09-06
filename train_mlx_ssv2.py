@@ -51,6 +51,7 @@ from nope_gdn_mlx import (
     load_videomae_base,
 )
 from ssv2_mlx_dataset import SSv2Dataset, StreamingDataLoader
+from nope_gdn_tiled_ops import validate_chunk_memory
 
 
 # =============================================================================
@@ -72,11 +73,9 @@ class TrainConfig:
     # Per §IV-F: ~74K parameters of temporal working memory per layer
     # (8 × 96² = 73,728). Matches the notebook's get_config(size="base").
     processor_heads: int = 8
-    # M-series threadgroup-memory cap: C·(C + head_dim) ≤ 8192. With head_dim=96,
-    # max chunk_size = 32 (32·128 = 4096 ≤ 8192). On CUDA + FLA's chunk_kda the
-    # notebook uses chunk_size=64 — but CUDA shared mem isn't capped at 32 KB,
-    # so the notebook's choice doesn't fit on Metal. C=32 → ~1.3-1.6× slower
-    # GDN backward vs C=64, but state size matches the paper exactly.
+    # Value/feature-tiled Metal kernels also support C=64 at head_dim=96.
+    # Retain the existing default; select --chunk_size 64 for a longer raster
+    # chunk without changing the paper's heads, state size, or checkpoint.
     chunk_size: int = 32
     drop_path_rate: float = 0.2      # match notebook
     dropout: float = 0.2             # match notebook
@@ -143,13 +142,7 @@ def build_model(cfg: TrainConfig) -> NoPEGDNClassifier:
     """Build, cast to bf16, set GDN compute path."""
     if cfg.gdn_path in ("chunkwise_kda", "chunkwise_kda_vjp"):
         head_dim = cfg.processor_dim // cfg.processor_heads
-        budget = (cfg.chunk_size ** 2 + cfg.chunk_size * head_dim) * 4
-        if budget > 32 * 1024:
-            raise ValueError(
-                f"chunk_size {cfg.chunk_size} × head_dim {head_dim} exceeds "
-                f"32 KB threadgroup memory ({budget/1024:.1f} KB needed). "
-                f"Lower chunk_size or use --gdn_path metal_vjp."
-            )
+        validate_chunk_memory(cfg.chunk_size, head_dim)
     if cfg.gdn_path == "metal_vjp":
         # The metal_vjp backward kernel keeps the per-step state matrix S
         # (D·D fp32) in threadgroup memory plus 8 D-vectors and ~140 bytes

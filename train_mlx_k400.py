@@ -48,6 +48,7 @@ from nope_gdn_mlx import (
     load_videomae_base,
 )
 from k400_mlx_dataset import K400Dataset, StreamingDataLoader
+from nope_gdn_tiled_ops import validate_chunk_memory
 
 
 # =============================================================================
@@ -120,22 +121,10 @@ class TrainConfig:
 def build_model(cfg: TrainConfig) -> NoPEGDNClassifier:
     """Build, cast to bf16, and switch GDN layers to the configured path
     (default: chunkwise_kda_vjp)."""
-    # Validate chunk_size against the chunkwise Metal solver's threadgroup
-    # memory budget when a chunkwise path is selected. The kernel reserves
-    #   L_tg[C, C] + y_cols[D, C]   = (C² + D·C) × 4 bytes
-    # of threadgroup memory, capped at 32 KB on M-series → C·(C + D) ≤ 8192.
+    # Validate the tiled solve AND gradient kernel memory requirements.
     if cfg.gdn_path in ("chunkwise_kda", "chunkwise_kda_vjp"):
         proc_head_dim = cfg.processor_dim // cfg.processor_heads
-        budget_bytes = (cfg.chunk_size * cfg.chunk_size
-                        + cfg.chunk_size * proc_head_dim) * 4
-        if budget_bytes > 32 * 1024:
-            raise ValueError(
-                f"GDN path {cfg.gdn_path!r} requires "
-                f"chunk_size·(chunk_size + head_dim) ≤ 8192, but got "
-                f"chunk_size={cfg.chunk_size}, head_dim={proc_head_dim} "
-                f"→ TG-mem need = {budget_bytes / 1024:.1f} KB > 32 KB. "
-                f"Lower chunk_size or fall back to gdn_path='metal_vjp'."
-            )
+        validate_chunk_memory(cfg.chunk_size, proc_head_dim)
 
     model = NoPEGDNClassifier(
         img_size=cfg.img_size, num_frames=cfg.num_frames,

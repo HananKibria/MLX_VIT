@@ -67,6 +67,10 @@ import math
 from typing import Optional, Tuple, Dict, List
 
 import mlx.core as mx
+from nope_gdn_tiled import chunk_solve_finalize_tiled, supports_tiled_chunk
+from nope_gdn_tiled_ops import (
+    m_moq_backward_tiled, solve_triangular_tiled, validate_chunk_memory,
+)
 import mlx.nn as nn
 
 
@@ -733,6 +737,8 @@ class GatedDeltaLayer(nn.Module):
                     f"(no per-step S_tg in TG memory) instead."
                 )
         self.compute_path = compute_path
+        if compute_path in ("chunkwise_kda", "chunkwise_kda_vjp"):
+            validate_chunk_memory(chunk_size, head_dim)
 
         # ---- Q, K, V projections ----
         self.q_proj = nn.Linear(hidden_size, total_dim, bias=False)
@@ -1165,20 +1171,14 @@ class GatedDeltaLayer(nn.Module):
         b : (BH, C, D)
         Returns y : (BH, C, D)
 
-        Constraint: (C*C + D*C) * 4 bytes must fit in threadgroup memory
-        (32 KB on M-series). With D = C this gives C ≤ 64 — exactly the
-        default chunk_size of GatedDeltaLayer. Larger C requires a tiled
-        layout (not yet implemented).
+        Uses the original kernel when (C*C + D*C)*4 fits in 32 KiB.
+        Otherwise tiles the independent RHS columns, so C=64, D=96 is
+        supported without reducing the head dimension or state precision.
         """
         BH, C, _ = L.shape
         D = b.shape[-1]
         if (C * C + D * C) * 4 > 32 * 1024:
-            raise ValueError(
-                f"_metal_solve_triangular: C={C}, D={D} exceeds TG-memory "
-                f"budget (C*C + D*C ≤ 8192); use a smaller chunk_size or "
-                f"split the RHS into D ≤ {(32 * 1024 // 4 - C * C) // C} "
-                f"column tiles."
-            )
+            return solve_triangular_tiled(L, b)
         kernel = cls._get_tri_solve_kernel(C, D)
         L = L.astype(mx.float32)
         b = b.astype(mx.float32)
@@ -1268,10 +1268,7 @@ class GatedDeltaLayer(nn.Module):
         BH, C, _ = U.shape
         D = b.shape[-1]
         if (C * C + D * C) * 4 > 32 * 1024:
-            raise ValueError(
-                f"_metal_solve_triangular_upper: C={C}, D={D} exceeds TG-memory "
-                f"budget (C*C + D*C ≤ 8192)."
-            )
+            return solve_triangular_tiled(U, b, upper=True)
         kernel = cls._get_tri_solve_upper_kernel(C, D)
         U = U.astype(mx.float32)
         b = b.astype(mx.float32)
@@ -1644,8 +1641,9 @@ class GatedDeltaLayer(nn.Module):
         const uint sg  = simdgroup_index_in_threadgroup;
         const uint nsg = simdgroups_per_threadgroup;
 
-        threadgroup float slot1[D * D];   // first 16 KB
-        threadgroup float slot2[C * D];   // second 16 KB
+        // Reused across differently shaped phases; reserve the maximum.
+        threadgroup float slot1[(D >= C) ? D * D : C * C];
+        threadgroup float slot2[(D >= C) ? D * D : C * D];
 
         // Base offsets per (B*H)
         const uint state_base    = bh * D * D;
@@ -1687,13 +1685,14 @@ class GatedDeltaLayer(nn.Module):
             const uint N_T = D / 8;
             const uint K_T = D / 8;
             const uint TOTAL = M_T * N_T;
-            const uint PER_SG = TOTAL / NSG;        // 16 at C=D=64, NSG=4
+            const uint PER_SG = (TOTAL + NSG - 1) / NSG;
             simdgroup_matrix<float, 8, 8> C_local[PER_SG];
 
             // Compute pass — pure reads from slot1/slot2, writes only to
             // per-thread registers.
             for (uint i = 0; i < PER_SG; ++i) {
                 const uint t = sg + i * nsg;
+                if (t >= TOTAL) continue;
                 const uint m_tile = t / N_T;
                 const uint n_tile = t % N_T;
                 C_local[i] = simdgroup_matrix<float, 8, 8>(0.0f);
@@ -1709,6 +1708,7 @@ class GatedDeltaLayer(nn.Module):
             // Store pass — writes only.
             for (uint i = 0; i < PER_SG; ++i) {
                 const uint t = sg + i * nsg;
+                if (t >= TOTAL) continue;
                 const uint m_tile = t / N_T;
                 const uint n_tile = t % N_T;
                 simdgroup_store(C_local[i],
@@ -2271,6 +2271,8 @@ class GatedDeltaLayer(nn.Module):
         Returns: dK, dQ, dγ : (BH, C, D) fp32
         """
         BH, C, D = K.shape
+        if D > 64 or 2 * C * D > 8192:
+            return m_moq_backward_tiled(K, Q, gamma, dM, dMoq)
         kernel_AB = cls._get_M_backward_AB_kernel(C, D)
         outs_AB = kernel_AB(
             inputs=[K, Q, gamma, dM, dMoq],
@@ -2425,6 +2427,16 @@ class GatedDeltaLayer(nn.Module):
             use_sg = False
             fuse_fn = self._metal_chunk_solve_finalize
 
+        # Value tiling keeps full D-dimensional keys and FP32 state while
+        # enabling the fused SIMD path above the old head-size limit.
+        # At C=16, the existing vendor-matmul inference path performed as
+        # well or better on the M4 Pro. Keep it for short time-only scans;
+        # the VJP path below still benefits from tiling at C=16.
+        if (self._use_fused_chunk_kernel and self._fused_chunk_use_simdgroup
+                and C >= 32 and D > 64 and supports_tiled_chunk(C, D)):
+            use_fused = True
+            fuse_fn = chunk_solve_finalize_tiled
+
         for ci in range(n_chunks):
             if use_fused:
                 O, state, _ = fuse_fn(
@@ -2537,6 +2549,11 @@ class GatedDeltaLayer(nn.Module):
                   and C % 8 == 0 and D % 8 == 0 and sg_fits)
         fuse_fn = self._metal_chunk_solve_finalize_sg if use_sg \
             else self._metal_chunk_solve_finalize
+
+        if (self._use_fused_chunk_kernel and self._fused_chunk_use_simdgroup
+                and D > 64 and supports_tiled_chunk(C, D)):
+            use_fused = True
+            fuse_fn = chunk_solve_finalize_tiled
 
         for ci in range(n_chunks):
             if use_fused:
